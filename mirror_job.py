@@ -1073,25 +1073,27 @@ async def sync_mirrors():
     episodes = await get_candidate_episodes(CANDIDATE_POOL_SIZE)
 
     log_message(f"Found {len(episodes)} candidate episodes for mirroring.")
-    downloads_done = 0
+    episodes_done = 0
 
     for ep in episodes:
-        if downloads_done >= MAX_MIRRORS_PER_RUN:
-            log_message(f"Reached max mirrors limit ({MAX_MIRRORS_PER_RUN}). Finishing cycle.")
+        if episodes_done >= MAX_MIRRORS_PER_RUN:
+            log_message(f"Reached max mirrors limit ({MAX_MIRRORS_PER_RUN} episodes). Finishing cycle.")
             break
 
+        saved_this_ep = 0
         for quality in TARGET_QUALITIES:
-            if downloads_done >= MAX_MIRRORS_PER_RUN:
-                break
             try:
                 saved = await mirror_quality(ep, quality, storage_files)
                 if saved:
-                    downloads_done += 1
-                    log_message(f"Progress: {downloads_done}/{MAX_MIRRORS_PER_RUN} mirrors this run.")
+                    saved_this_ep += 1
             except Exception as exc:
                 log_message(f"Mirror failed for {ep['title_romaji']} ep {ep['episode_number']} {quality}: {exc}")
 
-    log_message(f"Cycle complete: {downloads_done} mirror(s) saved.")
+        if saved_this_ep:
+            episodes_done += 1
+            log_message(f"Progress: {episodes_done}/{MAX_MIRRORS_PER_RUN} episodes this run ({saved_this_ep} file(s) saved).")
+
+    log_message(f"Cycle complete: {episodes_done} episode(s) mirrored.")
 
 
 async def main():
