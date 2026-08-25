@@ -33,6 +33,7 @@ TARGET_QUALITIES = ("720p", "480p")
 DOWNLOAD_TIMEOUT = _int_env("DOWNLOAD_TIMEOUT", 360)
 MIN_SEEDERS = _int_env("MIN_SEEDERS", 7)
 MAX_MIRRORS_PER_RUN = _int_env("MAX_MIRRORS_PER_RUN", 2)
+CANDIDATE_POOL_SIZE = _int_env("CANDIDATE_POOL_SIZE", 15)
 MISSING_GRACE_SECONDS = _int_env("MISSING_GRACE_SECONDS", 2 * 24 * 60 * 60)
 MAX_SEARCH_QUERIES = _int_env("MAX_SEARCH_QUERIES", 12)
 
@@ -1009,9 +1010,9 @@ async def save_episode_mirror(ep, quality: str, upload):
     ep[f"mirror_{q}_missing"] = 0
 
 
-async def mirror_quality(ep, quality: str, storage_files: dict):
+async def mirror_quality(ep, quality: str, storage_files: dict) -> bool:
     if quality_complete(ep, quality) or quality_marked_missing(ep, quality):
-        return
+        return False
 
     synonyms = ep.get("synonyms") or []
     is_special = (ep.get("format") in ["SPECIAL", "MOVIE", "OVA", "ONA"])
@@ -1028,7 +1029,7 @@ async def mirror_quality(ep, quality: str, storage_files: dict):
     if not release:
         log_message(f"No {quality} release found for {ep['title_romaji']} ep {ep['episode_number']}.")
         await mark_quality_missing(ep, quality)
-        return
+        return False
 
     log_message(f"Fetching {quality} with {DOWNLOAD_TIMEOUT}s timeout: {release['title']}")
     try:
@@ -1036,12 +1037,13 @@ async def mirror_quality(ep, quality: str, storage_files: dict):
     except subprocess.TimeoutExpired:
         log_message(f"Fetch timed out after {DOWNLOAD_TIMEOUT}s for {ep['title_romaji']} ep {ep['episode_number']} {quality}. Marking quality as missing.")
         await mark_quality_missing(ep, quality)
-        return
+        return False
     except Exception as exc:
         log_message(f"Fetch failed for {ep['title_romaji']} ep {ep['episode_number']} {quality}: {exc}. Marking quality as missing.")
         await mark_quality_missing(ep, quality)
-        return
+        return False
     size_mb = round(size_bytes / 1048576, 2)
+    saved = False
     try:
         if not provider_done(ep, quality, "pixeldrain"):
             existing_file = storage_files.get(video_name.lower())
@@ -1051,8 +1053,10 @@ async def mirror_quality(ep, quality: str, storage_files: dict):
                 upload = await asyncio.to_thread(upload_to_storage, video_path, video_name)
             await save_episode_mirror(ep, quality, upload)
             log_message(f"Saved {quality} mirror for {ep['title_romaji']} ep {ep['episode_number']}: {upload['url']}")
+            saved = True
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
+    return saved
 
 
 # --- Main Sync Loop ---
@@ -1066,15 +1070,28 @@ async def sync_mirrors():
     await cleanup_storage_duplicates()
     storage_files = await get_storage_files()
 
-    episodes = await get_candidate_episodes(MAX_MIRRORS_PER_RUN)
+    episodes = await get_candidate_episodes(CANDIDATE_POOL_SIZE)
 
     log_message(f"Found {len(episodes)} candidate episodes for mirroring.")
+    downloads_done = 0
+
     for ep in episodes:
+        if downloads_done >= MAX_MIRRORS_PER_RUN:
+            log_message(f"Reached max mirrors limit ({MAX_MIRRORS_PER_RUN}). Finishing cycle.")
+            break
+
         for quality in TARGET_QUALITIES:
+            if downloads_done >= MAX_MIRRORS_PER_RUN:
+                break
             try:
-                await mirror_quality(ep, quality, storage_files)
+                saved = await mirror_quality(ep, quality, storage_files)
+                if saved:
+                    downloads_done += 1
+                    log_message(f"Progress: {downloads_done}/{MAX_MIRRORS_PER_RUN} mirrors this run.")
             except Exception as exc:
                 log_message(f"Mirror failed for {ep['title_romaji']} ep {ep['episode_number']} {quality}: {exc}")
+
+    log_message(f"Cycle complete: {downloads_done} mirror(s) saved.")
 
 
 async def main():
