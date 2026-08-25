@@ -980,6 +980,7 @@ async def queue_fresh_search(ep_id):
             pixeldrain_id = NULL,
             pixeldrain_1080_url = NULL,
             pixeldrain_1080_id = NULL,
+            magnet_link = NULL,
             last_checked = NULL,
             uploaded_at = NULL
         WHERE id = ?
@@ -1047,15 +1048,18 @@ async def reconcile_storage():
         log_message("LinkGuardian: main 1080 files are not visible in this storage account (separate account?). Skipping main-link guardian.")
 
     repairs_done = 0
+    repair_attempts = 0
 
     for row in dead_main:
         if main_visible == 0:
             break
+        if repair_attempts >= MAX_REPAIRS_PER_RUN:
+            log_message(f"LinkGuardian: repair budget ({MAX_REPAIRS_PER_RUN}) reached, deferring remaining dead links to next cycle.")
+            break
         label = f"main link for {row['title_romaji']} ep {row['episode_number']}"
         magnet = row.get("magnet_link") or ""
         if magnet.startswith("http"):
-            if repairs_done >= MAX_REPAIRS_PER_RUN:
-                continue
+            repair_attempts += 1
             applied = await restore_from_source(
                 magnet, label, row["ep_id"],
                 """
@@ -1070,22 +1074,17 @@ async def reconcile_storage():
             if applied:
                 repairs_done += 1
                 continue
+            await execute_sql("UPDATE episodes SET magnet_link = NULL WHERE id = ?", [row["ep_id"]])
         await queue_fresh_search(row["ep_id"])
         log_message(f"LinkGuardian: {label} is dead and queued for fresh search.")
 
     for row, q in dead_mirrors:
         label = f"{q} mirror for {row['title_romaji']} ep {row['episode_number']}"
         stored_src = row.get(f"mirror_{q}_source") or ""
-        if stored_src.startswith("http"):
-            if repairs_done >= MAX_REPAIRS_PER_RUN:
-                await execute_sql(f"""
-                    UPDATE episodes
-                    SET pixeldrain_{q}_url = NULL, pixeldrain_{q}_id = NULL,
-                        mirror_{q}_missing = 0, mirror_updated_at = ?
-                    WHERE id = ?
-                """, [int(time.time()), row["ep_id"]])
-                continue
-            applied = await restore_from_source(
+        restored = False
+        if stored_src.startswith("http") and repair_attempts < MAX_REPAIRS_PER_RUN:
+            repair_attempts += 1
+            restored = await restore_from_source(
                 stored_src, label, row["ep_id"],
                 f"""
                 UPDATE episodes
@@ -1096,16 +1095,17 @@ async def reconcile_storage():
                 """,
                 [],
             )
-            if applied:
+            if restored:
                 repairs_done += 1
-                continue
-        await execute_sql(f"""
-            UPDATE episodes
-            SET pixeldrain_{q}_url = NULL, pixeldrain_{q}_id = NULL,
-                mirror_{q}_missing = 0, mirror_updated_at = ?
-            WHERE id = ?
-        """, [int(time.time()), row["ep_id"]])
-        log_message(f"LinkGuardian: {label} is dead, cleared for re-mirror.")
+        if not restored:
+            await execute_sql(f"""
+                UPDATE episodes
+                SET pixeldrain_{q}_url = NULL, pixeldrain_{q}_id = NULL,
+                    mirror_{q}_source = NULL,
+                    mirror_{q}_missing = 0, mirror_updated_at = ?
+                WHERE id = ?
+            """, [int(time.time()), row["ep_id"]])
+            log_message(f"LinkGuardian: {label} is dead, cleared for re-mirror.")
 
     if dead_main or dead_mirrors:
         log_message(f"LinkGuardian: found {len(dead_main)} dead main link(s), {len(dead_mirrors)} dead mirror(s). Repairs this run: {repairs_done}.")
