@@ -640,7 +640,7 @@ async def fetch_query(query: str, romaji: str, english: str, ep: int, quality: s
             }, follow_redirects=True) as client:
                 response = await client.get(source)
                 if response.status_code != 200:
-                    log_message(f"Source {source[:50]}... returned status {response.status_code}")
+                    log_message(f"GAS proxy returned status {response.status_code}")
                     continue
 
                 raw_items = []
@@ -704,7 +704,7 @@ async def fetch_query(query: str, romaji: str, english: str, ep: int, quality: s
                     results.extend(source_results)
                     break
         except Exception as e:
-            log_message(f"Source timeout/error: {str(e)[:120]}")
+            log_message(f"Source timeout/error: {type(e).__name__}: {str(e)[:80]}")
 
     return results
 
@@ -1052,7 +1052,7 @@ async def mirror_quality(ep, quality: str, storage_files: dict) -> bool:
             else:
                 upload = await asyncio.to_thread(upload_to_storage, video_path, video_name)
             await save_episode_mirror(ep, quality, upload)
-            log_message(f"Saved {quality} mirror for {ep['title_romaji']} ep {ep['episode_number']}: {upload['url']}")
+            log_message(f"Saved {quality} mirror for {ep['title_romaji']} ep {ep['episode_number']}.")
             saved = True
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
