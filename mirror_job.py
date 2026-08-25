@@ -51,7 +51,6 @@ TRACKERS = [
 STORAGE_API = "https://" + "pixel" + "drain.com/api"
 INDEX_HOST = "ny" + "aa.si"
 INDEX_DL = "https://ny" + "aa.iss.one/download"
-INDEX_RSS = "https://ny" + "aa.site/"
 
 
 def log_message(msg: str):
@@ -625,11 +624,11 @@ def is_trusted_release(title: str) -> bool:
 
 
 async def fetch_query(query: str, romaji: str, english: str, ep: int, quality: str, synonyms: list, is_special: bool, tier3_only: bool, aired_at: int, now_ts: int) -> list:
+    if not GAS_PROXY_URL:
+        log_message("GAS_PROXY_URL is not configured; skipping search.")
+        return []
     encoded_query = urllib.parse.quote(query)
-    sources = []
-    if GAS_PROXY_URL:
-        sources.append(f"{GAS_PROXY_URL}?q={encoded_query}")
-    sources.append(f"{INDEX_RSS}?page=rss&q={encoded_query}")
+    sources = [f"{GAS_PROXY_URL}?q={encoded_query}"]
     results = []
 
     for source in sources:
@@ -702,7 +701,7 @@ async def fetch_query(query: str, romaji: str, english: str, ep: int, quality: s
 
                 if source_results:
                     results.extend(source_results)
-                    break  # success, skip fallback source and move to next query
+                    break
         except Exception as e:
             log_message(f"Source timeout/error: {str(e)[:120]}")
 
