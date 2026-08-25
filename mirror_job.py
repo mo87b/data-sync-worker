@@ -34,6 +34,7 @@ DOWNLOAD_TIMEOUT = _int_env("DOWNLOAD_TIMEOUT", 360)
 MIN_SEEDERS = _int_env("MIN_SEEDERS", 7)
 MAX_MIRRORS_PER_RUN = _int_env("MAX_MIRRORS_PER_RUN", 2)
 CANDIDATE_POOL_SIZE = _int_env("CANDIDATE_POOL_SIZE", 15)
+MAX_REPAIRS_PER_RUN = _int_env("MAX_REPAIRS_PER_RUN", 3)
 MISSING_GRACE_SECONDS = _int_env("MISSING_GRACE_SECONDS", 2 * 24 * 60 * 60)
 MAX_SEARCH_QUERIES = _int_env("MAX_SEARCH_QUERIES", 12)
 
@@ -149,6 +150,8 @@ async def ensure_schema():
         "mirror_1080_missing": "INTEGER NOT NULL DEFAULT 0",
         "mirror_720_missing": "INTEGER NOT NULL DEFAULT 0",
         "mirror_480_missing": "INTEGER NOT NULL DEFAULT 0",
+        "mirror_720_source": "TEXT",
+        "mirror_480_source": "TEXT",
     }
     for name, column_type in columns.items():
         if name not in existing:
@@ -955,6 +958,161 @@ async def cleanup_storage_duplicates():
         pass
 
 
+# --- Link Guardian ---
+async def get_storage_file_ids():
+    if not STORAGE_KEY:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(f"{STORAGE_API}/user/files?limit=1000", auth=("", STORAGE_KEY))
+            if response.status_code == 200:
+                return {f.get("id") for f in response.json().get("files", []) if f.get("id")}
+    except Exception as exc:
+        log_message(f"LinkGuardian: storage list error: {exc}")
+    return None
+
+
+async def queue_fresh_search(ep_id):
+    await execute_sql("""
+        UPDATE episodes
+        SET status = 'pending',
+            stream_url = NULL,
+            pixeldrain_id = NULL,
+            pixeldrain_1080_url = NULL,
+            pixeldrain_1080_id = NULL,
+            last_checked = NULL,
+            uploaded_at = NULL
+        WHERE id = ?
+    """, [ep_id])
+
+
+async def restore_from_source(source: str, label: str, ep_id: str, apply_sql: str, apply_args: list) -> bool:
+    try:
+        work_dir, v_path, v_name, size_bytes = await asyncio.to_thread(download_release, source, f"restore {label}")
+        size_mb = round(size_bytes / 1048576, 2)
+        upload = await asyncio.to_thread(upload_to_storage, v_path, v_name)
+        shutil.rmtree(work_dir, ignore_errors=True)
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        args = [upload["url"], upload["file_id"]] + list(apply_args) + [size_mb, now_str, ep_id]
+        await execute_sql(apply_sql, args)
+        log_message(f"LinkGuardian: restored {label} from stored source (same file re-uploaded).")
+        return True
+    except Exception as exc:
+        try:
+            shutil.rmtree(work_dir, ignore_errors=True)
+        except Exception:
+            pass
+        log_message(f"LinkGuardian: restore failed for {label} ({type(exc).__name__}). Falling back to fresh search.")
+        return False
+
+
+async def reconcile_storage():
+    remote_ids = await get_storage_file_ids()
+    if remote_ids is None:
+        log_message("LinkGuardian: storage listing unavailable, skipping.")
+        return
+
+    rows = await execute_sql("""
+        SELECT e.id AS ep_id, e.episode_number, e.status, e.magnet_link,
+               e.pixeldrain_1080_id, e.pixeldrain_720_id, e.pixeldrain_480_id,
+               e.mirror_720_source, e.mirror_480_source,
+               a.title_romaji
+        FROM episodes e
+        JOIN anime a ON e.anime_id = a.id
+        WHERE e.status = 'ready'
+    """) or []
+
+    main_tracked = [r for r in rows if r.get("pixeldrain_1080_id")]
+    dead_main = [r for r in main_tracked if r["pixeldrain_1080_id"] not in remote_ids]
+    main_visible = len(main_tracked) - len(dead_main)
+
+    dead_mirrors = []
+    tracked_ids = set()
+    for r in rows:
+        for q in ("720", "480"):
+            qid = r.get(f"pixeldrain_{q}_id")
+            if qid:
+                tracked_ids.add(qid)
+                if qid not in remote_ids:
+                    dead_mirrors.append((r, q))
+    if main_visible > 0:
+        tracked_ids.update(r["pixeldrain_1080_id"] for r in main_tracked)
+
+    missing_count = len([i for i in tracked_ids if i not in remote_ids])
+    if tracked_ids and missing_count * 2 > len(tracked_ids):
+        log_message(f"LinkGuardian: {missing_count}/{len(tracked_ids)} tracked links missing - looks like an account/auth issue, not individual deletions. Aborting to protect the library.")
+        return
+
+    if main_tracked and main_visible == 0:
+        log_message("LinkGuardian: main 1080 files are not visible in this storage account (separate account?). Skipping main-link guardian.")
+
+    repairs_done = 0
+
+    for row in dead_main:
+        if main_visible == 0:
+            break
+        label = f"main link for {row['title_romaji']} ep {row['episode_number']}"
+        magnet = row.get("magnet_link") or ""
+        if magnet.startswith("http"):
+            if repairs_done >= MAX_REPAIRS_PER_RUN:
+                continue
+            applied = await restore_from_source(
+                magnet, label, row["ep_id"],
+                """
+                UPDATE episodes
+                SET stream_url = ?, pixeldrain_id = ?,
+                    pixeldrain_1080_url = ?, pixeldrain_1080_id = ?,
+                    file_size_mb = ?, uploaded_at = ?
+                WHERE id = ?
+                """,
+                [],
+            )
+            if applied:
+                repairs_done += 1
+                continue
+        await queue_fresh_search(row["ep_id"])
+        log_message(f"LinkGuardian: {label} is dead and queued for fresh search.")
+
+    for row, q in dead_mirrors:
+        label = f"{q} mirror for {row['title_romaji']} ep {row['episode_number']}"
+        stored_src = row.get(f"mirror_{q}_source") or ""
+        if stored_src.startswith("http"):
+            if repairs_done >= MAX_REPAIRS_PER_RUN:
+                await execute_sql(f"""
+                    UPDATE episodes
+                    SET pixeldrain_{q}_url = NULL, pixeldrain_{q}_id = NULL,
+                        mirror_{q}_missing = 0, mirror_updated_at = ?
+                    WHERE id = ?
+                """, [int(time.time()), row["ep_id"]])
+                continue
+            applied = await restore_from_source(
+                stored_src, label, row["ep_id"],
+                f"""
+                UPDATE episodes
+                SET pixeldrain_{q}_url = ?, pixeldrain_{q}_id = ?,
+                    mirror_{q}_missing = 0,
+                    file_size_mb = ?, mirror_updated_at = ?
+                WHERE id = ?
+                """,
+                [],
+            )
+            if applied:
+                repairs_done += 1
+                continue
+        await execute_sql(f"""
+            UPDATE episodes
+            SET pixeldrain_{q}_url = NULL, pixeldrain_{q}_id = NULL,
+                mirror_{q}_missing = 0, mirror_updated_at = ?
+            WHERE id = ?
+        """, [int(time.time()), row["ep_id"]])
+        log_message(f"LinkGuardian: {label} is dead, cleared for re-mirror.")
+
+    if dead_main or dead_mirrors:
+        log_message(f"LinkGuardian: found {len(dead_main)} dead main link(s), {len(dead_mirrors)} dead mirror(s). Repairs this run: {repairs_done}.")
+    else:
+        log_message("LinkGuardian: all links healthy.")
+
+
 # --- Quality State Helpers ---
 def quality_key(quality: str):
     return quality.rstrip("p")
@@ -993,21 +1151,23 @@ async def mark_quality_missing(ep, quality: str):
     ep[f"mirror_{q}_missing"] = 1
 
 
-async def save_episode_mirror(ep, quality: str, upload):
+async def save_episode_mirror(ep, quality: str, upload, source: str = None):
     q = quality_key(quality)
     now_ts = int(time.time())
     await execute_sql(f"""
         UPDATE episodes
         SET mirror_updated_at = ?,
             mirror_{q}_missing = 0,
+            mirror_{q}_source = ?,
             pixeldrain_{q}_url = ?,
             pixeldrain_{q}_id = ?
         WHERE id = ?
-    """, [now_ts, upload["url"], upload.get("file_id"), ep["ep_id"]])
+    """, [now_ts, source, upload["url"], upload.get("file_id"), ep["ep_id"]])
 
     ep[f"pixeldrain_{q}_url"] = upload["url"]
     ep[f"pixeldrain_{q}_id"] = upload.get("file_id")
     ep[f"mirror_{q}_missing"] = 0
+    ep[f"mirror_{q}_source"] = source
 
 
 async def mirror_quality(ep, quality: str, storage_files: dict) -> bool:
@@ -1051,7 +1211,7 @@ async def mirror_quality(ep, quality: str, storage_files: dict) -> bool:
                 upload = {"url": f"{STORAGE_API}/file/{existing_file['id']}", "file_id": existing_file["id"]}
             else:
                 upload = await asyncio.to_thread(upload_to_storage, video_path, video_name)
-            await save_episode_mirror(ep, quality, upload)
+            await save_episode_mirror(ep, quality, upload, release["source"])
             log_message(f"Saved {quality} mirror for {ep['title_romaji']} ep {ep['episode_number']}.")
             saved = True
     finally:
@@ -1068,6 +1228,7 @@ async def sync_mirrors():
 
     await ensure_schema()
     await cleanup_storage_duplicates()
+    await reconcile_storage()
     storage_files = await get_storage_files()
 
     episodes = await get_candidate_episodes(CANDIDATE_POOL_SIZE)

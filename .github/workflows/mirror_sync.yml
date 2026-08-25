@@ -10,6 +10,10 @@ on:
   repository_dispatch:
     types: [trigger-mirror-sync]
 
+concurrency:
+  group: mirror-sync-pipeline
+  cancel-in-progress: false
+
 jobs:
   run-sync-pipeline:
     name: Execute Data Pipeline
