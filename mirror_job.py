@@ -925,10 +925,18 @@ async def delete_from_storage(file_id: str) -> bool:
 
 
 async def cleanup_storage_duplicates():
-    """Purges duplicate files by name from the storage account, keeping the oldest upload."""
+    """Purges duplicate files by name from the storage account.
+    Never deletes files referenced by the database; otherwise keeps the oldest."""
     if not STORAGE_KEY:
         return
     try:
+        referenced_rows = await execute_sql("""
+            SELECT pixeldrain_1080_id AS pid FROM episodes WHERE pixeldrain_1080_id IS NOT NULL
+            UNION SELECT pixeldrain_720_id FROM episodes WHERE pixeldrain_720_id IS NOT NULL
+            UNION SELECT pixeldrain_480_id FROM episodes WHERE pixeldrain_480_id IS NOT NULL
+        """) or []
+        referenced = {r["pid"] for r in referenced_rows if r.get("pid")}
+
         async with httpx.AsyncClient(timeout=30.0) as client:
             r = await client.get(f"{STORAGE_API}/user/files", auth=("", STORAGE_KEY))
             if r.status_code != 200:
@@ -945,10 +953,14 @@ async def cleanup_storage_duplicates():
             saved_bytes = 0
             for name, flist in by_name.items():
                 if len(flist) > 1:
-                    flist.sort(key=lambda x: x.get("date_upload", ""))
-                    for dup in flist[1:]:
-                        to_delete.append(dup["id"])
-                        saved_bytes += dup.get("size", 0)
+                    keep_ids = {f["id"] for f in flist if f["id"] in referenced}
+                    if not keep_ids:
+                        flist.sort(key=lambda x: x.get("date_upload", ""))
+                        keep_ids = {flist[0]["id"]}
+                    for dup in flist:
+                        if dup["id"] not in keep_ids:
+                            to_delete.append(dup["id"])
+                            saved_bytes += dup.get("size", 0)
 
             if to_delete:
                 for fid in to_delete:
@@ -987,22 +999,42 @@ async def queue_fresh_search(ep_id):
     """, [ep_id])
 
 
-async def restore_from_source(source: str, label: str, ep_id: str, apply_sql: str, apply_args: list) -> bool:
+async def restore_from_source(source: str, label: str, ep_id: str, quality: str = None) -> bool:
+    """Re-download the exact stored torrent and re-upload it.
+    quality=None repairs the main 1080 slot, otherwise the given mirror quality."""
+    work_dir = None
     try:
         work_dir, v_path, v_name, size_bytes = await asyncio.to_thread(download_release, source, f"restore {label}")
         size_mb = round(size_bytes / 1048576, 2)
         upload = await asyncio.to_thread(upload_to_storage, v_path, v_name)
         shutil.rmtree(work_dir, ignore_errors=True)
+        work_dir = None
+        now_ts = int(time.time())
         now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        args = [upload["url"], upload["file_id"]] + list(apply_args) + [size_mb, now_str, ep_id]
-        await execute_sql(apply_sql, args)
+        if quality:
+            q = quality_key(quality)
+            await execute_sql(f"""
+                UPDATE episodes
+                SET pixeldrain_{q}_url = ?, pixeldrain_{q}_id = ?,
+                    mirror_{q}_source = ?,
+                    mirror_{q}_missing = 0,
+                    file_size_mb = ?, mirror_updated_at = ?
+                WHERE id = ?
+            """, [upload["url"], upload["file_id"], source, size_mb, now_ts, ep_id])
+        else:
+            await execute_sql("""
+                UPDATE episodes
+                SET stream_url = ?, pixeldrain_id = ?,
+                    pixeldrain_1080_url = ?, pixeldrain_1080_id = ?,
+                    file_size_mb = ?, uploaded_at = ?, last_checked = ?
+                WHERE id = ?
+            """, [upload["url"], upload["file_id"], upload["url"], upload["file_id"],
+                  size_mb, now_str, now_ts, ep_id])
         log_message(f"LinkGuardian: restored {label} from stored source (same file re-uploaded).")
         return True
     except Exception as exc:
-        try:
+        if work_dir:
             shutil.rmtree(work_dir, ignore_errors=True)
-        except Exception:
-            pass
         log_message(f"LinkGuardian: restore failed for {label} ({type(exc).__name__}). Falling back to fresh search.")
         return False
 
@@ -1060,17 +1092,7 @@ async def reconcile_storage():
         magnet = row.get("magnet_link") or ""
         if magnet.startswith("http"):
             repair_attempts += 1
-            applied = await restore_from_source(
-                magnet, label, row["ep_id"],
-                """
-                UPDATE episodes
-                SET stream_url = ?, pixeldrain_id = ?,
-                    pixeldrain_1080_url = ?, pixeldrain_1080_id = ?,
-                    file_size_mb = ?, uploaded_at = ?
-                WHERE id = ?
-                """,
-                [],
-            )
+            applied = await restore_from_source(magnet, label, row["ep_id"])
             if applied:
                 repairs_done += 1
                 continue
@@ -1084,17 +1106,7 @@ async def reconcile_storage():
         restored = False
         if stored_src.startswith("http") and repair_attempts < MAX_REPAIRS_PER_RUN:
             repair_attempts += 1
-            restored = await restore_from_source(
-                stored_src, label, row["ep_id"],
-                f"""
-                UPDATE episodes
-                SET pixeldrain_{q}_url = ?, pixeldrain_{q}_id = ?,
-                    mirror_{q}_missing = 0,
-                    file_size_mb = ?, mirror_updated_at = ?
-                WHERE id = ?
-                """,
-                [],
-            )
+            restored = await restore_from_source(stored_src, label, row["ep_id"], quality=q)
             if restored:
                 repairs_done += 1
         if not restored:
