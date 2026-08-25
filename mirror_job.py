@@ -4,6 +4,7 @@ import sys
 import json
 import time
 import base64
+import hashlib
 import shutil
 import tempfile
 import asyncio
@@ -779,6 +780,49 @@ async def search_quality(romaji: str, english: str, ep: int, quality: str, aired
 
 
 # --- Downloader & Storage Uploader ---
+def extract_info_hash(payload: bytes) -> str:
+    """SHA-1 of the raw bencoded 'info' dictionary of a .torrent file."""
+    try:
+        data = payload
+
+        def read_str(i):
+            colon = data.index(b":", i)
+            length = int(data[i:colon])
+            start = colon + 1
+            return start, start + length
+
+        def skip(i):
+            c = data[i:i+1]
+            if c == b"i":
+                end = data.index(b"e", i)
+                return end + 1
+            if c in (b"d", b"l"):
+                i += 1
+                is_dict = c == b"d"
+                while data[i:i+1] != b"e":
+                    if is_dict:
+                        _, i = read_str(i)
+                    i = skip(i)
+                return i + 1
+            _, end = read_str(i)
+            return end
+
+        if data[:1] != b"d":
+            return None
+        i = 1
+        while data[i:i+1] != b"e":
+            ks, ke = read_str(i)
+            key = data[ks:ke]
+            val_start = ke
+            val_end = skip(val_start)
+            if key == b"info":
+                return hashlib.sha1(data[val_start:val_end]).hexdigest()
+            i = val_end
+    except Exception:
+        return None
+    return None
+
+
 def is_valid_payload(data: bytes) -> bool:
     """Verifies that bytes represent a valid bencoded metadata file (starts with 'd' and is not HTML)."""
     if not data or len(data) < 50:
@@ -791,6 +835,7 @@ def is_valid_payload(data: bytes) -> bool:
 
 def download_release(link: str, release_title: str):
     work_dir = tempfile.mkdtemp(prefix="mirror_")
+    meta_bytes = None
     try:
         source_input = link
         if link.startswith("http"):
@@ -810,6 +855,7 @@ def download_release(link: str, release_title: str):
                                 if is_valid_payload(raw_bytes):
                                     with open(meta_path, "wb") as f:
                                         f.write(raw_bytes)
+                                    meta_bytes = raw_bytes
                                     source_input = meta_path
                                     prepared = True
                                     log_message("Prepared job via relay.")
@@ -830,6 +876,7 @@ def download_release(link: str, release_title: str):
                         if resp.status_code == 200 and is_valid_payload(resp.content):
                             with open(meta_path, "wb") as f:
                                 f.write(resp.content)
+                            meta_bytes = resp.content
                             source_input = meta_path
                             prepared = True
                 except Exception as direct_err:
@@ -877,7 +924,8 @@ def download_release(link: str, release_title: str):
                     best_size = size
         if not best_path:
             raise RuntimeError(f"No video file downloaded for {release_title}")
-        return work_dir, best_path, os.path.basename(best_path), best_size
+        info_hash = extract_info_hash(meta_bytes) if meta_bytes else None
+        return work_dir, best_path, os.path.basename(best_path), best_size, info_hash
     except Exception:
         shutil.rmtree(work_dir, ignore_errors=True)
         raise
@@ -1004,7 +1052,7 @@ async def restore_from_source(source: str, label: str, ep_id: str, quality: str 
     quality=None repairs the main 1080 slot, otherwise the given mirror quality."""
     work_dir = None
     try:
-        work_dir, v_path, v_name, size_bytes = await asyncio.to_thread(download_release, source, f"restore {label}")
+        work_dir, v_path, v_name, size_bytes, _info_hash = await asyncio.to_thread(download_release, source, f"restore {label}")
         size_mb = round(size_bytes / 1048576, 2)
         upload = await asyncio.to_thread(upload_to_storage, v_path, v_name)
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -1205,7 +1253,9 @@ async def mirror_quality(ep, quality: str, storage_files: dict) -> bool:
 
     log_message(f"Fetching {quality} with {DOWNLOAD_TIMEOUT}s timeout: {release['title']}")
     try:
-        work_dir, video_path, video_name, size_bytes = await asyncio.to_thread(download_release, release["source"], release["title"])
+        work_dir, video_path, video_name, size_bytes, info_hash = await asyncio.to_thread(
+            download_release, release["source"], release["title"]
+        )
     except subprocess.TimeoutExpired:
         log_message(f"Fetch timed out after {DOWNLOAD_TIMEOUT}s for {ep['title_romaji']} ep {ep['episode_number']} {quality}. Marking quality as missing.")
         await mark_quality_missing(ep, quality)
@@ -1215,6 +1265,10 @@ async def mirror_quality(ep, quality: str, storage_files: dict) -> bool:
         await mark_quality_missing(ep, quality)
         return False
     size_mb = round(size_bytes / 1048576, 2)
+    stored_source = (
+        f"magnet:?xt=urn:btih:{info_hash}&dn={urllib.parse.quote(release['title'])}"
+        if info_hash else release["source"]
+    )
     saved = False
     try:
         if not provider_done(ep, quality, "pixeldrain"):
@@ -1223,7 +1277,7 @@ async def mirror_quality(ep, quality: str, storage_files: dict) -> bool:
                 upload = {"url": f"{STORAGE_API}/file/{existing_file['id']}", "file_id": existing_file["id"]}
             else:
                 upload = await asyncio.to_thread(upload_to_storage, video_path, video_name)
-            await save_episode_mirror(ep, quality, upload, release["source"])
+            await save_episode_mirror(ep, quality, upload, stored_source)
             log_message(f"Saved {quality} mirror for {ep['title_romaji']} ep {ep['episode_number']}.")
             saved = True
     finally:
