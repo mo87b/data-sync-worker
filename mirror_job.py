@@ -77,15 +77,16 @@ def log_message(msg: str):
 
 
 def missing_config():
-    return [
-        name for name, value in {
-            "TURSO_URL": TURSO_URL,
-            "TURSO_TOKEN": TURSO_TOKEN,
-            "STORAGE_KEY": STORAGE_KEY,
-            "GAS_PROXY_URL": GAS_PROXY_URL,
-        }.items()
-        if not value
-    ]
+    missing = []
+    if not TURSO_URL:
+        missing.append("TURSO_URL")
+    if not TURSO_TOKEN:
+        missing.append("TURSO_TOKEN")
+    if not STORAGE_KEY:
+        missing.append("STORAGE_KEY")
+    if not GAS_PROXIES:
+        missing.append("RELAY_URL")
+    return missing
 
 
 # --- Database Helpers ---
