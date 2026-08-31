@@ -19,7 +19,22 @@ import httpx
 TURSO_URL = os.environ.get("TURSO_URL", "")
 TURSO_TOKEN = os.environ.get("TURSO_TOKEN", "")
 STORAGE_KEY = os.environ.get("STORAGE_KEY", "")
-GAS_PROXY_URL = os.environ.get("GAS_PROXY_URL", "")
+
+GAS_PROXIES = []
+for _k in ["GAS_PROXY_URL", "RELAY_URL", "GAS_PROXY_URL_2", "GAS_PROXY_URL_3"]:
+    _v = os.environ.get(_k, "").strip()
+    if _v and _v not in GAS_PROXIES:
+        GAS_PROXIES.append(_v)
+
+_proxy_idx = 0
+def get_ordered_proxies() -> list:
+    global _proxy_idx
+    if not GAS_PROXIES:
+        return []
+    n = len(GAS_PROXIES)
+    start = _proxy_idx % n
+    _proxy_idx += 1
+    return [GAS_PROXIES[(start + i) % n] for i in range(n)]
 
 
 def _int_env(name: str, default: int) -> int:
@@ -562,6 +577,35 @@ def get_search_queries(romaji: str, english: str, ep: int, quality: str, synonym
         if cleaned_erai:
             search_bases.append(cleaned_erai)
     search_bases.extend([r_base, e_base])
+    
+    # Japanese suffix / hyphen variations (e.g. Tenkousaki -> Tenkou-saki / Tenkou saki)
+    COMMON_SUFFIXES = ["saki", "tabi", "gumi", "jima", "bashi", "mura", "kan", "sou", "ken", "chou"]
+    for title_base in [r_base] + synonyms:
+        if not title_base:
+            continue
+        c_words = clean_and_strip(title_base).split()
+        for i, w in enumerate(c_words[:3]):
+            w_lower = w.lower()
+            if "-" in w:
+                unhyphen = w.replace("-", "")
+                spaced = w.replace("-", " ")
+                v1 = " ".join(c_words[:i] + [unhyphen] + c_words[i+1:])
+                v2 = " ".join(c_words[:i] + [spaced] + c_words[i+1:])
+                for var in (v1, v2):
+                    if var and var not in search_bases:
+                        search_bases.append(var)
+            else:
+                for sfx in COMMON_SUFFIXES:
+                    if w_lower.endswith(sfx) and len(w_lower) > len(sfx) + 2:
+                        pfx = w[:-len(sfx)]
+                        hyphen_var = f"{pfx}-{sfx}"
+                        space_var = f"{pfx} {sfx}"
+                        v1 = " ".join(c_words[:i] + [hyphen_var] + c_words[i+1:])
+                        v2 = " ".join(c_words[:i] + [space_var] + c_words[i+1:])
+                        for var in (v1, v2):
+                            if var and var not in search_bases:
+                                search_bases.append(var)
+
     for syn in synonyms:
         cleaned_syn = clean_and_strip(syn)
         if cleaned_syn and cleaned_syn not in search_bases:
@@ -629,48 +673,68 @@ def is_trusted_release(title: str) -> bool:
 
 
 async def fetch_query(query: str, romaji: str, english: str, ep: int, quality: str, synonyms: list, is_special: bool, tier3_only: bool, aired_at: int, now_ts: int) -> list:
-    if not GAS_PROXY_URL:
-        log_message("GAS_PROXY_URL is not configured; skipping search.")
+    proxies = get_ordered_proxies()
+    if not proxies:
+        log_message("GAS proxies are not configured; skipping search.")
         return []
     encoded_query = urllib.parse.quote(query)
-    sources = [f"{GAS_PROXY_URL}?q={encoded_query}"]
     results = []
 
-    for source in sources:
+    transport = httpx.AsyncHTTPTransport(retries=2)
+    for proxy_base in proxies:
+        source = f"{proxy_base}?q={encoded_query}"
         try:
-            await asyncio.sleep(0.5)
-            async with httpx.AsyncClient(timeout=30.0, headers={
+            await asyncio.sleep(0.3)
+            async with httpx.AsyncClient(transport=transport, timeout=20.0, headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
             }, follow_redirects=True) as client:
                 response = await client.get(source)
                 if response.status_code != 200:
-                    log_message(f"GAS proxy returned status {response.status_code}")
                     continue
 
                 raw_items = []
-                root = ET.fromstring(response.content)
-                items = root.findall(".//item")
-                for item in items:
-                    title_el = item.find("title")
-                    link_el = item.find("link")
-                    pub_el = item.find("pubDate")
-                    title = title_el.text if title_el is not None else ""
-                    link = link_el.text if link_el is not None else ""
-                    pub_date_ts = 0
-                    if pub_el is not None and pub_el.text:
-                        try:
-                            pub_date_ts = int(email.utils.parsedate_to_datetime(pub_el.text).timestamp())
-                        except Exception:
+                text = response.text
+                if text.startswith("{"):
+                    try:
+                        data = response.json()
+                        payload = data.get("data")
+                        if isinstance(payload, list):
+                            for item in payload:
+                                raw_items.append({
+                                    "title": item.get("title", ""),
+                                    "link": item.get("torrent", "") or item.get("link", ""),
+                                    "seeders": int(item.get("seeders") or 0),
+                                    "pub_date": int(item.get("pub_date") or item.get("timestamp") or 0)
+                                })
+                    except Exception:
+                        pass
+                elif "<rss" in text or "<item" in text:
+                    try:
+                        root = ET.fromstring(response.content)
+                        items = root.findall(".//item")
+                        for item in items:
+                            title_el = item.find("title")
+                            link_el = item.find("link")
+                            pub_el = item.find("pubDate")
+                            title = title_el.text if title_el is not None else ""
+                            link = link_el.text if link_el is not None else ""
                             pub_date_ts = 0
-                    seeders = 0
-                    for child in item:
-                        if child.tag.endswith("seeders"):
-                            try:
-                                seeders = int(child.text or 0)
-                            except ValueError:
-                                seeders = 0
-                            break
-                    raw_items.append({"title": title, "link": link, "seeders": seeders, "pub_date": pub_date_ts})
+                            if pub_el is not None and pub_el.text:
+                                try:
+                                    pub_date_ts = int(email.utils.parsedate_to_datetime(pub_el.text).timestamp())
+                                except Exception:
+                                    pub_date_ts = 0
+                            seeders = 0
+                            for child in item:
+                                if child.tag.endswith("seeders"):
+                                    try:
+                                        seeders = int(child.text or 0)
+                                    except ValueError:
+                                        seeders = 0
+                                    break
+                            raw_items.append({"title": title, "link": link, "seeders": seeders, "pub_date": pub_date_ts})
+                    except Exception:
+                        pass
 
                 source_results = []
                 for entry in raw_items:
@@ -684,13 +748,11 @@ async def fetch_query(query: str, romaji: str, english: str, ep: int, quality: s
                     if not is_matching_release(title, romaji, english, ep, quality, synonyms=synonyms, is_special=is_special):
                         continue
 
-                    # During the first 10 minutes after airing, only premium platform releases qualify
                     if tier3_only and get_platform_score(title) < 3:
                         continue
                     if is_blacklisted_platform(title):
                         continue
 
-                    # Extract release ID
                     id_match = re.search(r'/download/(\d+)', link)
                     if id_match:
                         release_id = id_match.group(1)
@@ -699,16 +761,15 @@ async def fetch_query(query: str, romaji: str, english: str, ep: int, quality: s
 
                     source_results.append({
                         "title": title,
-                        "source": f"{INDEX_DL}/{release_id}.to" + "rrent",
+                        "source": f"https://nyaa.si/download/{release_id}.torrent",
                         "seeders": seeders,
                         "pub_date": entry["pub_date"],
                     })
 
                 if source_results:
-                    results.extend(source_results)
-                    break
+                    return source_results
         except Exception as e:
-            log_message(f"Source timeout/error: {type(e).__name__}: {str(e)[:80]}")
+            continue
 
     return results
 
@@ -842,12 +903,13 @@ def download_release(link: str, release_title: str):
             meta_path = os.path.join(work_dir, "payload.bin")
             prepared = False
 
-            # Preferred route: relay first (runner IPs are often blocked/rate-limited upstream)
-            if GAS_PROXY_URL:
+            # Preferred route: relay first via available GAS proxies with failover
+            relay_target = link.replace("ny" + "aa.iss.one", INDEX_HOST).replace("ny" + "aa.site", INDEX_HOST)
+            sync_transport = httpx.HTTPTransport(retries=2)
+            for proxy_base in get_ordered_proxies():
                 try:
-                    relay_target = link.replace("ny" + "aa.iss.one", INDEX_HOST).replace("ny" + "aa.site", INDEX_HOST)
-                    with httpx.Client(timeout=30.0, follow_redirects=True) as client:
-                        res = client.get(GAS_PROXY_URL, params={"mode": ("tor" + "rent"), "url": relay_target})
+                    with httpx.Client(transport=sync_transport, timeout=30.0, follow_redirects=True) as client:
+                        res = client.get(proxy_base, params={"mode": "torrent", "url": relay_target})
                         if res.status_code == 200:
                             data = res.json()
                             if data.get("status") == 200 and data.get("data"):
@@ -859,14 +921,9 @@ def download_release(link: str, release_title: str):
                                     source_input = meta_path
                                     prepared = True
                                     log_message("Prepared job via relay.")
-                                else:
-                                    log_message("Relay returned invalid payload.")
-                            else:
-                                log_message(f"Relay returned upstream status {data.get('status')}.")
-                        else:
-                            log_message(f"Relay returned HTTP {res.status_code}.")
+                                    break
                 except Exception as relay_err:
-                    log_message(f"Relay failed: {str(relay_err)[:120]}")
+                    continue
 
             # Fallback: direct fetch, validated before use
             if not prepared:
