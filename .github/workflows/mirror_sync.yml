@@ -42,12 +42,12 @@ jobs:
 
       - name: Execute Pipeline Worker
         env:
-          TURSO_URL: ${{ secrets.DB_URL || secrets.TURSO_URL }}
-          TURSO_TOKEN: ${{ secrets.DB_TOKEN || secrets.TURSO_TOKEN }}
-          STORAGE_KEY: ${{ secrets.STORAGE_KEY || secrets.PIXELDRAIN_API_KEY }}
-          GAS_PROXY_URL: ${{ secrets.RELAY_URL || secrets.GAS_PROXY_URL }}
-          GAS_PROXY_URL_2: ${{ secrets.GAS_PROXY_URL_2 }}
-          GAS_PROXY_URL_3: ${{ secrets.GAS_PROXY_URL_3 }}
+          TURSO_URL: ${{ secrets.DB_URL }}
+          TURSO_TOKEN: ${{ secrets.DB_TOKEN }}
+          STORAGE_KEY: ${{ secrets.STORAGE_KEY }}
+          GAS_PROXY_URL: ${{ secrets.RELAY_URL }}
+          GAS_PROXY_URL_2: ${{ secrets.RELAY_URL_2 }}
+          GAS_PROXY_URL_3: ${{ secrets.RELAY_URL_3 }}
           MAX_MIRRORS_PER_RUN: ${{ inputs.limit || github.event.client_payload.limit || '2' }}
         run: |
           python mirror_job.py
