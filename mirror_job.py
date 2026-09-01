@@ -973,95 +973,6 @@ def inspect_media_tracks(video_path: str) -> tuple:
     return ", ".join(sorted_subs), ", ".join(sorted_audio)
 
 
-def detect_platform_name(title: str) -> str:
-    t = (title or "").lower()
-    if re.search(r'\b(cr|crunchyroll)\b', t):
-        return "Crunchyroll"
-    elif re.search(r'\b(nf|netflix)\b', t):
-        return "Netflix"
-    elif re.search(r'\b(amzn|amazon)\b', t):
-        return "Amazon"
-    elif re.search(r'\b(shahid)\b', t):
-        return "Shahid"
-    elif re.search(r'\b(adn)\b', t):
-        return "ADN"
-    elif re.search(r'\b(bili|bilibili)\b', t):
-        return "Bilibili"
-    elif re.search(r'\b(disney|dnp)\b', t):
-        return "Disney"
-    elif re.search(r'\b(abema)\b', t):
-        return "Abema"
-    elif re.search(r'\b(iq|iqiyi)\b', t):
-        return "iQiyi"
-    return ""
-
-
-def parse_track_entries(tracks_str: str) -> set:
-    """Parses track strings like 'Arabic (Crunchyroll), English' into {(lang, platform), ...}."""
-    entries = set()
-    if not tracks_str or not isinstance(tracks_str, str):
-        return entries
-    for item in tracks_str.split(","):
-        item_clean = item.strip()
-        if not item_clean:
-            continue
-        m = re.match(r'^([A-Za-z]+)(?:\s*\(([^)]+)\))?$', item_clean)
-        if m:
-            lang = m.group(1).strip()
-            platform = (m.group(2) or "").strip()
-            entries.add((lang, platform))
-        else:
-            entries.add((item_clean, ""))
-    return entries
-
-
-def format_smart_track_list(entries: set) -> str:
-    """Formats entries into a clean string, only appending (Platform) if a language is present on multiple distinct platforms."""
-    if not entries:
-        return ""
-    
-    by_lang = {}
-    for lang, platform in entries:
-        if not lang:
-            continue
-        by_lang.setdefault(lang, set()).add(platform)
-
-    formatted_items = []
-    ORDER = ["Arabic", "English", "French", "Japanese", "Chinese", "Korean"]
-    sorted_langs = sorted(by_lang.keys(), key=lambda x: ORDER.index(x) if x in ORDER else 99)
-
-    for lang in sorted_langs:
-        platforms = by_lang[lang]
-        distinct_platforms = [p for p in platforms if p]
-        if len(distinct_platforms) > 1:
-            for p in sorted(distinct_platforms):
-                formatted_items.append(f"{lang} ({p})")
-        else:
-            formatted_items.append(lang)
-
-    return ", ".join(formatted_items)
-
-
-def merge_track_lists(existing_tracks: str, new_tracks: str, new_platform: str = "") -> str:
-    """Merges existing track string with newly detected tracks from a platform."""
-    entries = parse_track_entries(existing_tracks)
-    
-    if new_tracks:
-        for t in str(new_tracks).split(","):
-            t_clean = t.strip()
-            if not t_clean:
-                continue
-            m = re.match(r'^([A-Za-z]+)(?:\s*\(([^)]+)\))?$', t_clean)
-            if m:
-                lang = m.group(1).strip()
-                plat = (m.group(2) or new_platform).strip()
-                entries.add((lang, plat))
-            else:
-                entries.add((t_clean, new_platform))
-
-    return format_smart_track_list(entries)
-
-
 def download_release(link: str, release_title: str):
     work_dir = tempfile.mkdtemp(prefix="mirror_")
     meta_bytes = None
@@ -1439,8 +1350,8 @@ async def mark_quality_missing(ep, quality: str):
 async def save_episode_mirror(ep, quality: str, upload, source: str = None, subs: str = None, audio: str = None):
     q = quality_key(quality)
     now_ts = int(time.time())
-    subs_to_save = subs or ep.get("subtitles")
-    audio_to_save = audio or ep.get("audio_tracks")
+    subs_to_save = ep.get("subtitles") or subs
+    audio_to_save = ep.get("audio_tracks") or audio
     await execute_sql(f"""
         UPDATE episodes
         SET mirror_updated_at = ?,
@@ -1505,18 +1416,15 @@ async def mirror_quality(ep, quality: str, storage_files: dict) -> bool:
     saved = False
     try:
         if not provider_done(ep, quality, "pixeldrain"):
-            plat_name = detect_platform_name(release["title"])
             subs_found, audio_found = inspect_media_tracks(video_path)
-            merged_subs = merge_track_lists(ep.get("subtitles"), subs_found, plat_name)
-            merged_audio = merge_track_lists(ep.get("audio_tracks"), audio_found, plat_name)
 
             existing_file = storage_files.get(video_name.lower())
             if existing_file:
                 upload = {"url": f"{STORAGE_API}/file/{existing_file['id']}", "file_id": existing_file["id"]}
             else:
                 upload = await asyncio.to_thread(upload_to_storage, video_path, video_name)
-            await save_episode_mirror(ep, quality, upload, stored_source, subs=merged_subs, audio=merged_audio)
-            log_message(f"Saved {quality} mirror for {ep['title_romaji']} ep {ep['episode_number']}. Tracks: Subs=[{merged_subs}] Audio=[{merged_audio}]")
+            await save_episode_mirror(ep, quality, upload, stored_source, subs=subs_found, audio=audio_found)
+            log_message(f"Saved {quality} mirror for {ep['title_romaji']} ep {ep['episode_number']}.")
             saved = True
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
