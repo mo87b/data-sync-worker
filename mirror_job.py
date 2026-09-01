@@ -386,6 +386,10 @@ def get_clean_words(title: str) -> list:
     # Remove any other non-alphanumeric characters
     clean_t = re.sub(r'[^a-zA-Z0-9\s]', ' ', clean_t)
     words = clean_t.split()
+    if not words:
+        clean_with_num = title_no_se.replace('.', ' ').replace('-', ' ').replace("'", "")
+        clean_with_num = re.sub(r'[^a-zA-Z0-9\s]', ' ', clean_with_num)
+        words = clean_with_num.split()
     filtered = []
     for w in words:
         w_stripped = w.strip("-'")
@@ -693,7 +697,7 @@ async def fetch_query(query: str, romaji: str, english: str, ep: int, quality: s
                     continue
 
                 raw_items = []
-                text = response.text
+                text = response.text.strip()
                 if text.startswith("{"):
                     try:
                         data = response.json()
