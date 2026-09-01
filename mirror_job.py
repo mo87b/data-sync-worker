@@ -171,6 +171,12 @@ async def ensure_schema():
         "mirror_480_source": "TEXT",
         "subtitles": "TEXT",
         "audio_tracks": "TEXT",
+        "subtitles_1080": "TEXT",
+        "audio_tracks_1080": "TEXT",
+        "subtitles_720": "TEXT",
+        "audio_tracks_720": "TEXT",
+        "subtitles_480": "TEXT",
+        "audio_tracks_480": "TEXT",
     }
     for name, column_type in columns.items():
         if name not in existing:
@@ -186,6 +192,9 @@ CANDIDATES_SQL = """
            e.pixeldrain_480_url, e.pixeldrain_480_id,
            e.mirror_1080_missing, e.mirror_720_missing, e.mirror_480_missing,
            e.subtitles, e.audio_tracks,
+           e.subtitles_1080, e.audio_tracks_1080,
+           e.subtitles_720, e.audio_tracks_720,
+           e.subtitles_480, e.audio_tracks_480,
            a.anilist_id, a.title_romaji, a.title_english, a.format, a.erai_title, a.synonyms
     FROM episodes e
     JOIN anime a ON e.anime_id = a.id
@@ -1350,8 +1359,8 @@ async def mark_quality_missing(ep, quality: str):
 async def save_episode_mirror(ep, quality: str, upload, source: str = None, subs: str = None, audio: str = None):
     q = quality_key(quality)
     now_ts = int(time.time())
-    subs_to_save = ep.get("subtitles") or subs
-    audio_to_save = ep.get("audio_tracks") or audio
+    master_subs = ep.get("subtitles") or subs
+    master_audio = ep.get("audio_tracks") or audio
     await execute_sql(f"""
         UPDATE episodes
         SET mirror_updated_at = ?,
@@ -1359,19 +1368,23 @@ async def save_episode_mirror(ep, quality: str, upload, source: str = None, subs
             mirror_{q}_source = ?,
             pixeldrain_{q}_url = ?,
             pixeldrain_{q}_id = ?,
+            subtitles_{q} = ?,
+            audio_tracks_{q} = ?,
             subtitles = ?,
             audio_tracks = ?
         WHERE id = ?
-    """, [now_ts, source, upload["url"], upload.get("file_id"), subs_to_save, audio_to_save, ep["ep_id"]])
+    """, [now_ts, source, upload["url"], upload.get("file_id"), subs, audio, master_subs, master_audio, ep["ep_id"]])
 
     ep[f"pixeldrain_{q}_url"] = upload["url"]
     ep[f"pixeldrain_{q}_id"] = upload.get("file_id")
     ep[f"mirror_{q}_missing"] = 0
     ep[f"mirror_{q}_source"] = source
-    if subs_to_save:
-        ep["subtitles"] = subs_to_save
-    if audio_to_save:
-        ep["audio_tracks"] = audio_to_save
+    ep[f"subtitles_{q}"] = subs
+    ep[f"audio_tracks_{q}"] = audio
+    if master_subs:
+        ep["subtitles"] = master_subs
+    if master_audio:
+        ep["audio_tracks"] = master_audio
 
 
 async def mirror_quality(ep, quality: str, storage_files: dict) -> bool:
