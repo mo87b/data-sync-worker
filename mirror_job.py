@@ -169,6 +169,8 @@ async def ensure_schema():
         "mirror_480_missing": "INTEGER NOT NULL DEFAULT 0",
         "mirror_720_source": "TEXT",
         "mirror_480_source": "TEXT",
+        "subtitles": "TEXT",
+        "audio_tracks": "TEXT",
     }
     for name, column_type in columns.items():
         if name not in existing:
@@ -183,6 +185,7 @@ CANDIDATES_SQL = """
            e.pixeldrain_720_url, e.pixeldrain_720_id,
            e.pixeldrain_480_url, e.pixeldrain_480_id,
            e.mirror_1080_missing, e.mirror_720_missing, e.mirror_480_missing,
+           e.subtitles, e.audio_tracks,
            a.anilist_id, a.title_romaji, a.title_english, a.format, a.erai_title, a.synonyms
     FROM episodes e
     JOIN anime a ON e.anime_id = a.id
@@ -898,6 +901,96 @@ def is_valid_payload(data: bytes) -> bool:
     return data.startswith(b"d") and (b"announce" in data or b"info" in data)
 
 
+def inspect_media_tracks(video_path: str) -> tuple:
+    """Uses ffprobe to extract subtitle and audio tracks, keeping only allowed languages."""
+    ALLOWED_SUBS = {"Arabic", "English", "French", "Japanese"}
+    ALLOWED_AUDIO = {"Japanese", "Arabic", "English", "French", "Chinese", "Korean"}
+
+    LANG_MAP = {
+        "ara": "Arabic", "ar": "Arabic", "arabic": "Arabic", "العربية": "Arabic", "عربي": "Arabic",
+        "eng": "English", "en": "English", "english": "English",
+        "fra": "French", "fre": "French", "fr": "French", "french": "French", "français": "French",
+        "jpn": "Japanese", "ja": "Japanese", "japanese": "Japanese", "jp": "Japanese", "日本語": "Japanese",
+        "chi": "Chinese", "zho": "Chinese", "zh": "Chinese", "chinese": "Chinese",
+        "kor": "Korean", "ko": "Korean", "korean": "Korean",
+    }
+
+    def _resolve_lang(lang_tag: str, title_tag: str) -> str:
+        tag_str = (lang_tag or "").strip().lower()
+        title_str = (title_tag or "").strip().lower()
+
+        if tag_str in LANG_MAP:
+            return LANG_MAP[tag_str]
+        
+        for key, name in LANG_MAP.items():
+            if re.search(rf'\b{re.escape(key)}\b', title_str):
+                return name
+            if name.lower() in title_str:
+                return name
+        return None
+
+    found_subs = set()
+    found_audio = set()
+
+    try:
+        cmd = [
+            "ffprobe",
+            "-v", "quiet",
+            "-print_format", "json",
+            "-show_streams",
+            "-show_entries", "stream=codec_type:stream_tags=language,title",
+            video_path
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        if res.returncode == 0 and res.stdout:
+            data = json.loads(res.stdout)
+            streams = data.get("streams", [])
+            for s in streams:
+                c_type = s.get("codec_type")
+                tags = s.get("tags") or {}
+                lang_tag = tags.get("language")
+                title_tag = tags.get("title")
+
+                resolved = _resolve_lang(lang_tag, title_tag)
+                if c_type == "subtitle":
+                    if resolved and resolved in ALLOWED_SUBS:
+                        found_subs.add(resolved)
+                elif c_type == "audio":
+                    if resolved and resolved in ALLOWED_AUDIO:
+                        found_audio.add(resolved)
+                    elif not resolved and not found_audio:
+                        found_audio.add("Japanese")
+    except Exception as e:
+        log_message(f"Media probe warning: {e}")
+
+    if not found_audio:
+        found_audio.add("Japanese")
+
+    ORDER = ["Arabic", "English", "French", "Japanese", "Chinese", "Korean"]
+    sorted_subs = sorted(found_subs, key=lambda x: ORDER.index(x) if x in ORDER else 99)
+    sorted_audio = sorted(found_audio, key=lambda x: ORDER.index(x) if x in ORDER else 99)
+
+    return ", ".join(sorted_subs), ", ".join(sorted_audio)
+
+
+def merge_track_lists(existing_tracks: str, new_tracks: str) -> str:
+    """Merges two comma-separated lists of tracks without duplicates."""
+    items = set()
+    if existing_tracks:
+        for t in str(existing_tracks).split(","):
+            t_clean = t.strip()
+            if t_clean:
+                items.add(t_clean)
+    if new_tracks:
+        for t in str(new_tracks).split(","):
+            t_clean = t.strip()
+            if t_clean:
+                items.add(t_clean)
+    ORDER = ["Arabic", "English", "French", "Japanese", "Chinese", "Korean"]
+    sorted_items = sorted(items, key=lambda x: ORDER.index(x) if x in ORDER else 99)
+    return ", ".join(sorted_items)
+
+
 def download_release(link: str, release_title: str):
     work_dir = tempfile.mkdtemp(prefix="mirror_")
     meta_bytes = None
@@ -1272,23 +1365,31 @@ async def mark_quality_missing(ep, quality: str):
     ep[f"mirror_{q}_missing"] = 1
 
 
-async def save_episode_mirror(ep, quality: str, upload, source: str = None):
+async def save_episode_mirror(ep, quality: str, upload, source: str = None, subs: str = None, audio: str = None):
     q = quality_key(quality)
     now_ts = int(time.time())
+    subs_to_save = subs or ep.get("subtitles")
+    audio_to_save = audio or ep.get("audio_tracks")
     await execute_sql(f"""
         UPDATE episodes
         SET mirror_updated_at = ?,
             mirror_{q}_missing = 0,
             mirror_{q}_source = ?,
             pixeldrain_{q}_url = ?,
-            pixeldrain_{q}_id = ?
+            pixeldrain_{q}_id = ?,
+            subtitles = ?,
+            audio_tracks = ?
         WHERE id = ?
-    """, [now_ts, source, upload["url"], upload.get("file_id"), ep["ep_id"]])
+    """, [now_ts, source, upload["url"], upload.get("file_id"), subs_to_save, audio_to_save, ep["ep_id"]])
 
     ep[f"pixeldrain_{q}_url"] = upload["url"]
     ep[f"pixeldrain_{q}_id"] = upload.get("file_id")
     ep[f"mirror_{q}_missing"] = 0
     ep[f"mirror_{q}_source"] = source
+    if subs_to_save:
+        ep["subtitles"] = subs_to_save
+    if audio_to_save:
+        ep["audio_tracks"] = audio_to_save
 
 
 async def mirror_quality(ep, quality: str, storage_files: dict) -> bool:
@@ -1333,13 +1434,17 @@ async def mirror_quality(ep, quality: str, storage_files: dict) -> bool:
     saved = False
     try:
         if not provider_done(ep, quality, "pixeldrain"):
+            subs_found, audio_found = inspect_media_tracks(video_path)
+            merged_subs = merge_track_lists(ep.get("subtitles"), subs_found)
+            merged_audio = merge_track_lists(ep.get("audio_tracks"), audio_found)
+
             existing_file = storage_files.get(video_name.lower())
             if existing_file:
                 upload = {"url": f"{STORAGE_API}/file/{existing_file['id']}", "file_id": existing_file["id"]}
             else:
                 upload = await asyncio.to_thread(upload_to_storage, video_path, video_name)
-            await save_episode_mirror(ep, quality, upload, stored_source)
-            log_message(f"Saved {quality} mirror for {ep['title_romaji']} ep {ep['episode_number']}.")
+            await save_episode_mirror(ep, quality, upload, stored_source, subs=merged_subs, audio=merged_audio)
+            log_message(f"Saved {quality} mirror for {ep['title_romaji']} ep {ep['episode_number']}. Tracks: Subs=[{merged_subs}] Audio=[{merged_audio}]")
             saved = True
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
