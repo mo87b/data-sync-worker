@@ -282,13 +282,14 @@ def get_season_number(title: str) -> int:
         return int(m.group(1))
 
     # Roman numerals
-    if re.search(r'\bii\b$', title_lower) or re.search(r'\bii\b(?=\s)', title_lower):
+    clean_no_ver = re.sub(r'\bv\d+\b', '', title_lower)
+    if re.search(r'\bii\b$', clean_no_ver) or re.search(r'\bii\b(?=\s)', clean_no_ver):
         return 2
-    if re.search(r'\biii\b$', title_lower) or re.search(r'\biii\b(?=\s)', title_lower):
+    if re.search(r'\biii\b$', clean_no_ver) or re.search(r'\biii\b(?=\s)', clean_no_ver):
         return 3
-    if re.search(r'\biv\b$', title_lower) or re.search(r'\biv\b(?=\s)', title_lower):
+    if re.search(r'\biv\b$', clean_no_ver) or re.search(r'\biv\b(?=\s)', clean_no_ver):
         return 4
-    if re.search(r'\bv\b$', title_lower) or re.search(r'\bv\b(?=\s)', title_lower):
+    if (re.search(r'\bv\b$', clean_no_ver) or re.search(r'\bv\b(?=\s)', clean_no_ver)) and not re.search(r'\b(1080p|720p|480p|2160p|mkv|mp4|v)\s+v\b', title_lower):
         return 5
 
     # Standalone number at end
@@ -392,9 +393,7 @@ def get_clean_words(title: str) -> list:
             continue
         if w_stripped in SEASON_STOPWORDS or w_stripped in PARTICLES:
             continue
-        if len(w_stripped) >= 2:
-            filtered.append(w_stripped)
-        elif len(words) == 1:
+        if len(w_stripped) >= 2 or (len(w_stripped) == 1 and w_stripped.isalnum()):
             filtered.append(w_stripped)
     return filtered
 
