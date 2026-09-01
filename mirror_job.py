@@ -973,22 +973,93 @@ def inspect_media_tracks(video_path: str) -> tuple:
     return ", ".join(sorted_subs), ", ".join(sorted_audio)
 
 
-def merge_track_lists(existing_tracks: str, new_tracks: str) -> str:
-    """Merges two comma-separated lists of tracks without duplicates."""
-    items = set()
-    if existing_tracks:
-        for t in str(existing_tracks).split(","):
-            t_clean = t.strip()
-            if t_clean:
-                items.add(t_clean)
+def detect_platform_name(title: str) -> str:
+    t = (title or "").lower()
+    if re.search(r'\b(cr|crunchyroll)\b', t):
+        return "Crunchyroll"
+    elif re.search(r'\b(nf|netflix)\b', t):
+        return "Netflix"
+    elif re.search(r'\b(amzn|amazon)\b', t):
+        return "Amazon"
+    elif re.search(r'\b(shahid)\b', t):
+        return "Shahid"
+    elif re.search(r'\b(adn)\b', t):
+        return "ADN"
+    elif re.search(r'\b(bili|bilibili)\b', t):
+        return "Bilibili"
+    elif re.search(r'\b(disney|dnp)\b', t):
+        return "Disney"
+    elif re.search(r'\b(abema)\b', t):
+        return "Abema"
+    elif re.search(r'\b(iq|iqiyi)\b', t):
+        return "iQiyi"
+    return ""
+
+
+def parse_track_entries(tracks_str: str) -> set:
+    """Parses track strings like 'Arabic (Crunchyroll), English' into {(lang, platform), ...}."""
+    entries = set()
+    if not tracks_str or not isinstance(tracks_str, str):
+        return entries
+    for item in tracks_str.split(","):
+        item_clean = item.strip()
+        if not item_clean:
+            continue
+        m = re.match(r'^([A-Za-z]+)(?:\s*\(([^)]+)\))?$', item_clean)
+        if m:
+            lang = m.group(1).strip()
+            platform = (m.group(2) or "").strip()
+            entries.add((lang, platform))
+        else:
+            entries.add((item_clean, ""))
+    return entries
+
+
+def format_smart_track_list(entries: set) -> str:
+    """Formats entries into a clean string, only appending (Platform) if a language is present on multiple distinct platforms."""
+    if not entries:
+        return ""
+    
+    by_lang = {}
+    for lang, platform in entries:
+        if not lang:
+            continue
+        by_lang.setdefault(lang, set()).add(platform)
+
+    formatted_items = []
+    ORDER = ["Arabic", "English", "French", "Japanese", "Chinese", "Korean"]
+    sorted_langs = sorted(by_lang.keys(), key=lambda x: ORDER.index(x) if x in ORDER else 99)
+
+    for lang in sorted_langs:
+        platforms = by_lang[lang]
+        distinct_platforms = [p for p in platforms if p]
+        if len(distinct_platforms) > 1:
+            for p in sorted(distinct_platforms):
+                formatted_items.append(f"{lang} ({p})")
+        else:
+            formatted_items.append(lang)
+
+    return ", ".join(formatted_items)
+
+
+def merge_track_lists(existing_tracks: str, new_tracks: str, new_platform: str = "") -> str:
+    """Merges existing track string with newly detected tracks from a platform."""
+    entries = parse_track_entries(existing_tracks)
+    
     if new_tracks:
         for t in str(new_tracks).split(","):
             t_clean = t.strip()
-            if t_clean:
-                items.add(t_clean)
-    ORDER = ["Arabic", "English", "French", "Japanese", "Chinese", "Korean"]
-    sorted_items = sorted(items, key=lambda x: ORDER.index(x) if x in ORDER else 99)
-    return ", ".join(sorted_items)
+            if not t_clean:
+                continue
+            m = re.match(r'^([A-Za-z]+)(?:\s*\(([^)]+)\))?$', t_clean)
+            if m:
+                lang = m.group(1).strip()
+                plat = (m.group(2) or new_platform).strip()
+                entries.add((lang, plat))
+            else:
+                entries.add((t_clean, new_platform))
+
+    return format_smart_track_list(entries)
 
 
 def download_release(link: str, release_title: str):
@@ -1434,9 +1505,10 @@ async def mirror_quality(ep, quality: str, storage_files: dict) -> bool:
     saved = False
     try:
         if not provider_done(ep, quality, "pixeldrain"):
+            plat_name = detect_platform_name(release["title"])
             subs_found, audio_found = inspect_media_tracks(video_path)
-            merged_subs = merge_track_lists(ep.get("subtitles"), subs_found)
-            merged_audio = merge_track_lists(ep.get("audio_tracks"), audio_found)
+            merged_subs = merge_track_lists(ep.get("subtitles"), subs_found, plat_name)
+            merged_audio = merge_track_lists(ep.get("audio_tracks"), audio_found, plat_name)
 
             existing_file = storage_files.get(video_name.lower())
             if existing_file:
