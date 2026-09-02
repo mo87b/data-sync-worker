@@ -694,10 +694,6 @@ def get_search_queries(romaji: str, english: str, ep: int, quality: str, synonym
     for base in search_bases:
         if not base:
             continue
-        # Targeted trusted group queries first to bypass Nyaa RSS 75-item date truncation on older episodes
-        if base in (r_base, e_base) or (erai_title and base == clean_and_strip(erai_title)):
-            queries.append(f'[Erai-raws] {base} "{ep_str}" "{quality}"')
-            queries.append(f'[SubsPlease] {base} "{ep_str}" "{quality}"')
         queries.append(f'{base} "{ep_str}" "{quality}"')
         queries.append(f'{base} {ep_str} "{quality}"')
         if is_special and ep == 1:
@@ -705,9 +701,6 @@ def get_search_queries(romaji: str, english: str, ep: int, quality: str, synonym
         words = base.split()
         if len(words) > 3:
             short = " ".join(words[:3])
-            if base in (r_base, e_base):
-                queries.append(f'[Erai-raws] {short} "{ep_str}" "{quality}"')
-                queries.append(f'[SubsPlease] {short} "{ep_str}" "{quality}"')
             queries.append(f'{short} "{ep_str}" "{quality}"')
             queries.append(f'{short} {ep_str} "{quality}"')
             if is_special and ep == 1:
@@ -750,6 +743,19 @@ def get_search_queries(romaji: str, english: str, ep: int, quality: str, synonym
             if var_merged_o != var_merged:
                 queries.append(f'{var_merged_o} "{ep_str}" "{quality}"')
                 queries.append(f'{var_merged_o} {ep_str} "{quality}"')
+
+    # Fallback targeted group queries (Erai-raws & ToonsHub) to rescue older episodes buried past Nyaa RSS 75-item limits
+    for base in search_bases:
+        if not base:
+            continue
+        if base in (r_base, e_base) or (erai_title and base == clean_and_strip(erai_title)):
+            queries.append(f'[Erai-raws] {base} "{ep_str}" "{quality}"')
+            queries.append(f'[ToonsHub] {base} "{ep_str}" "{quality}"')
+            words = base.split()
+            if len(words) > 3:
+                short = " ".join(words[:3])
+                queries.append(f'[Erai-raws] {short} "{ep_str}" "{quality}"')
+                queries.append(f'[ToonsHub] {short} "{ep_str}" "{quality}"')
 
     return list(dict.fromkeys(queries))
 
