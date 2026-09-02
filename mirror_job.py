@@ -1241,6 +1241,19 @@ async def get_storage_file_ids():
     return None
 
 
+async def is_pixeldrain_file_alive(file_id: str) -> bool:
+    """Directly verify if a file actually exists on Pixeldrain via /api/file/{id}/info."""
+    if not file_id:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            r = await client.get(f"{STORAGE_API}/file/{file_id}/info")
+            return (r.status_code == 200)
+    except Exception:
+        # On network glitch or timeout, assume alive to protect user library
+        return True
+
+
 async def queue_fresh_search(ep_id):
     await execute_sql("""
         UPDATE episodes
@@ -1313,7 +1326,15 @@ async def reconcile_storage():
     """) or []
 
     main_tracked = [r for r in rows if r.get("pixeldrain_1080_id")]
-    dead_main = [r for r in main_tracked if r["pixeldrain_1080_id"] not in remote_ids]
+    dead_main = []
+    for r in main_tracked:
+        fid = r["pixeldrain_1080_id"]
+        if fid not in remote_ids:
+            if not await is_pixeldrain_file_alive(fid):
+                dead_main.append(r)
+            else:
+                remote_ids.add(fid)
+
     main_visible = len(main_tracked) - len(dead_main)
 
     dead_mirrors = []
@@ -1324,7 +1345,10 @@ async def reconcile_storage():
             if qid:
                 tracked_ids.add(qid)
                 if qid not in remote_ids:
-                    dead_mirrors.append((r, q))
+                    if not await is_pixeldrain_file_alive(qid):
+                        dead_mirrors.append((r, q))
+                    else:
+                        remote_ids.add(qid)
     if main_visible > 0:
         tracked_ids.update(r["pixeldrain_1080_id"] for r in main_tracked)
 
@@ -1347,15 +1371,13 @@ async def reconcile_storage():
             break
         label = f"main link for {row['title_romaji']} ep {row['episode_number']}"
         magnet = row.get("magnet_link") or ""
-        if magnet.startswith("http"):
+        if magnet:
             repair_attempts += 1
             applied = await restore_from_source(magnet, label, row["ep_id"])
             if applied:
                 repairs_done += 1
                 continue
-            await execute_sql("UPDATE episodes SET magnet_link = NULL WHERE id = ?", [row["ep_id"]])
-        await queue_fresh_search(row["ep_id"])
-        log_message(f"LinkGuardian: {label} is dead and queued for fresh search.")
+        log_message(f"LinkGuardian: {label} ({row.get('pixeldrain_1080_id')}) is verified dead on Pixeldrain.")
 
     for row, q in dead_mirrors:
         label = f"{q} mirror for {row['title_romaji']} ep {row['episode_number']}"
