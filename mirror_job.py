@@ -694,6 +694,10 @@ def get_search_queries(romaji: str, english: str, ep: int, quality: str, synonym
     for base in search_bases:
         if not base:
             continue
+        # Targeted trusted group queries first to bypass Nyaa RSS 75-item date truncation on older episodes
+        if base in (r_base, e_base) or (erai_title and base == clean_and_strip(erai_title)):
+            queries.append(f'[Erai-raws] {base} "{ep_str}" "{quality}"')
+            queries.append(f'[SubsPlease] {base} "{ep_str}" "{quality}"')
         queries.append(f'{base} "{ep_str}" "{quality}"')
         queries.append(f'{base} {ep_str} "{quality}"')
         if is_special and ep == 1:
@@ -701,6 +705,9 @@ def get_search_queries(romaji: str, english: str, ep: int, quality: str, synonym
         words = base.split()
         if len(words) > 3:
             short = " ".join(words[:3])
+            if base in (r_base, e_base):
+                queries.append(f'[Erai-raws] {short} "{ep_str}" "{quality}"')
+                queries.append(f'[SubsPlease] {short} "{ep_str}" "{quality}"')
             queries.append(f'{short} "{ep_str}" "{quality}"')
             queries.append(f'{short} {ep_str} "{quality}"')
             if is_special and ep == 1:
