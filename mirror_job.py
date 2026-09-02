@@ -331,18 +331,55 @@ def get_platform_score(title: str) -> int:
 
 def get_audio_score(title: str) -> int:
     """
-    Score 2: Multi-Audio (e.g. MULTi AAC / Multi-Audio)
-    Score 1: Dual-Audio (e.g. DUAL / Dual-Audio)
-    Score 0: Standard / Single Audio
+    Score hierarchy:
+      4: Multi-Audio (e.g. MULTi-Audio / MULTi AAC)
+      3: Dual-Audio (e.g. DUAL / Dual-Audio / DUAL AAC)
+      2: Explicit Japanese Audio (e.g. (JA), (JP), Japanese Dub, Japanese Audio, WEB-DLJPN)
+      1: Default / Standard Japanese (clean anime release with no foreign audio tags)
+     -5: Foreign Single Audio Only (e.g. (KA), Korean Audio, (ZH), Chinese Dub, standalone English Dub)
     """
     if not title or not isinstance(title, str):
         return 0
     t_lower = title.lower()
+
+    # 1. Multi-Audio (highest priority)
     if re.search(r'\bmulti[- ]audio\b|multiaudio|\bmulti\s+aac\b', t_lower):
+        return 4
+
+    # 2. Dual-Audio
+    if re.search(r'\bdual[- ]audio\b|dualaudio|\bdual\s+aac\b|\bdual\b', t_lower):
+        return 3
+
+    # 3. Check for Explicit Foreign Audio Only (Korean, Chinese, English dub, etc. without Dual/Multi)
+    is_foreign = bool(re.search(
+        r'[\(\[]\s*(ka|ko|kor|zh|cn|chi)\s*[\)\]]|'
+        r'\b(korean|kor)\s*[-_ ]*(audio|dub)\b|'
+        r'\b(chinese|mandarin)\s*[-_ ]*(audio|dub)\b|'
+        r'\b(english|eng)\s*[-_ ]*dub\b|'
+        r'web-dl\s*(kor|chi)',
+        t_lower
+    ))
+
+    # 4. Explicit Japanese Audio
+    is_japanese = bool(re.search(
+        r'[\(\[]\s*(ja|jp|jpn)\s*[\)\]]|'
+        r'\b(japanese|jpn|jap)\s*[-_ ]*(audio|dub)\b|'
+        r'web-dl\s*jpn',
+        t_lower
+    ))
+
+    if is_foreign and not is_japanese:
+        return -5
+
+    if is_japanese:
         return 2
-    if re.search(r'\bdual[- ]audio\b|dualaudio|\bdual\b', t_lower):
-        return 1
-    return 0
+
+    # 5. Default Japanese (standard anime release)
+    return 1
+
+def is_multi_audio_torrent(title: str) -> bool:
+    return get_audio_score(title) >= 3
+
 
 
 def is_blacklisted_platform(title: str) -> bool:
@@ -450,13 +487,34 @@ def is_matching_release(release_title: str, romaji: str, english: str, ep: int, 
             words = get_clean_words(clean_t)
             if not words:
                 return False
-            # Exact word boundary matching (\bword\b) to avoid single letters inside unrelated words
-            matching_words = [w for w in words if re.search(rf'\b{re.escape(w)}\b', release_title_lower)]
+
+            matching_words = set()
+            for w in words:
+                if re.search(rf'\b{re.escape(w)}\b', release_title_lower):
+                    matching_words.add(w)
+
+            # Check adjacent merged words (e.g. "Dogul Wang" -> "Dogulwang", "Chainsaw Man" -> "Chainsawman")
+            for i in range(len(words) - 1):
+                w1, w2 = words[i], words[i+1]
+                if len(w1) >= 2 and len(w2) >= 2:
+                    pair = w1 + w2
+                    if re.search(rf'\b{re.escape(pair)}\b', release_title_lower):
+                        matching_words.add(w1)
+                        matching_words.add(w2)
+
+            # Check if entire title with no spaces matches
+            if len(words) >= 2:
+                all_merged = "".join(words)
+                if re.search(rf'\b{re.escape(all_merged)}\b', release_title_lower):
+                    for w in words:
+                        matching_words.add(w)
+
+            ratio = len(matching_words) / len(words)
             if len(words) <= 2:
                 return len(matching_words) == len(words)
             if len(words) == 3:
                 return len(matching_words) >= 2
-            return len(matching_words) / len(words) >= 0.75
+            return ratio >= 0.75
 
         if check_match(anime_title):
             return True
@@ -523,45 +581,44 @@ def is_matching_release(release_title: str, romaji: str, english: str, ep: int, 
     # Fast-track for trusted release groups
     is_trusted_group = bool(re.search(r'\[?(erai[-_ ]?raws|toonshub)\]?', t_lower))
 
-    # Extra words check: verify release doesn't contain a different cour/season subtitle (e.g. New World vs Science Future)
-    # For trusted release groups, bypass extra_words check since their titles are verified and structured
-    if not is_trusted_group:
-        release_clean = clean_title(release_title)
-        release_words = get_clean_words(release_clean)
+    # Extra words check: verify release doesn't contain a different cour/season subtitle
+    release_clean = clean_title(release_title)
+    release_words = get_clean_words(release_clean)
 
-        anime_words = set()
-        anime_words.update(get_clean_words(romaji))
-        if english:
-            anime_words.update(get_clean_words(english))
-        for syn in valid_synonyms:
-            if syn:
-                anime_words.update(get_clean_words(syn))
+    anime_words = set()
+    anime_words.update(get_clean_words(romaji))
+    if english:
+        anime_words.update(get_clean_words(english))
+    for syn in valid_synonyms:
+        if syn:
+            anime_words.update(get_clean_words(syn))
 
-        extra_words = []
-        # Identify adjacent pairs of release words that concatenate to a word in anime_words (e.g. "itte" + "kara" -> "ittekara")
-        concat_parts = set()
-        for i in range(len(release_words) - 1):
-            pair_word = release_words[i] + release_words[i + 1]
-            if pair_word in anime_words:
-                concat_parts.add(release_words[i])
-                concat_parts.add(release_words[i + 1])
+    extra_words = []
+    # Identify adjacent pairs of release words that concatenate to a word in anime_words (e.g. "itte" + "kara" -> "ittekara")
+    concat_parts = set()
+    for i in range(len(release_words) - 1):
+        pair_word = release_words[i] + release_words[i + 1]
+        if pair_word in anime_words:
+            concat_parts.add(release_words[i])
+            concat_parts.add(release_words[i + 1])
 
-        for w in release_words:
-            if w in anime_words or w in concat_parts:
-                continue
-            is_concat = False
-            for w1 in anime_words:
-                if len(w1) >= 3 and w.startswith(w1):
-                    remainder = w[len(w1):]
-                    if remainder in anime_words:
-                        is_concat = True
-                        break
-            if not is_concat:
-                extra_words.append(w)
+    for w in release_words:
+        if w in anime_words or w in concat_parts:
+            continue
+        is_concat = False
+        for w1 in anime_words:
+            if len(w1) >= 3 and w.startswith(w1):
+                remainder = w[len(w1):]
+                if remainder in anime_words:
+                    is_concat = True
+                    break
+        if not is_concat:
+            extra_words.append(w)
 
-        if extra_words:
-            log_message(f"Rejected release match due to mismatched/extra words: {extra_words} (Anime: {romaji})")
-            return False
+    max_extra = 2 if is_trusted_group else 0
+    if len(extra_words) > max_extra:
+        log_message(f"Rejected release match due to mismatched/extra words: {extra_words} (Anime: {romaji})")
+        return False
 
     # Multi-sub mandatory (supporting all multi-sub title conventions)
     if not re.search(
@@ -593,6 +650,12 @@ def get_search_queries(romaji: str, english: str, ep: int, quality: str, synonym
         if cleaned_erai:
             search_bases.append(cleaned_erai)
     search_bases.extend([r_base, e_base])
+    
+    # Collapsed variations (e.g. "Dogul Wang" -> "Dogulwang", "Chainsaw Man" -> "Chainsawman")
+    if len(r_base.split()) >= 2:
+        r_collapsed = "".join(r_base.split())
+        if len(r_collapsed) >= 3 and r_collapsed not in search_bases:
+            search_bases.append(r_collapsed)
     
     # Japanese suffix / hyphen variations (e.g. Tenkousaki -> Tenkou-saki / Tenkou saki)
     COMMON_SUFFIXES = ["saki", "tabi", "gumi", "jima", "bashi", "mura", "kan", "sou", "ken", "chou"]
