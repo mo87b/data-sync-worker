@@ -203,6 +203,7 @@ CANDIDATES_SQL = """
             (COALESCE(e.mirror_720_missing, 0) = 0 AND e.pixeldrain_720_id IS NULL)
          OR (COALESCE(e.mirror_480_missing, 0) = 0 AND e.pixeldrain_480_id IS NULL)
       )
+      AND NOT (a.anilist_id = 21 AND e.episode_number < 1100)
     ORDER BY e.aired_at DESC, COALESCE(e.last_checked, 0) ASC
     LIMIT ?
 """
@@ -1403,11 +1404,17 @@ async def mark_quality_missing(ep, quality: str):
     q = quality_key(quality)
     now_ts = int(time.time())
     aired_at = ep.get("aired_at") or 0
+    anilist_id = ep.get("anilist_id")
+    ep_num = ep.get("episode_number") or 0
+
+    # Always update last_checked so this episode won't immediately monopolize the next cycle
+    await execute_sql("UPDATE episodes SET last_checked = ? WHERE id = ?", [now_ts, ep["ep_id"]])
 
     # Grace period: If episode aired within the last 2 days (48 hours), do NOT mark it permanently missing.
-    # It might be uploaded 5-10 minutes later by release groups. Allow future sync cycles to retry!
-    if aired_at > 0 and (now_ts - aired_at < MISSING_GRACE_SECONDS):
-        log_message(f"[{ep.get('title_romaji')}] Ep {ep.get('episode_number')} {quality} not found yet, but within grace period. Will retry next cycle.")
+    # Exclude old archive episodes (e.g. One Piece < 1100) from grace period!
+    is_old_archive = (anilist_id == 21 and ep_num < 1100)
+    if not is_old_archive and aired_at > 0 and (now_ts - aired_at < MISSING_GRACE_SECONDS):
+        log_message(f"[{ep.get('title_romaji')}] Ep {ep_num} {quality} not found yet, but within grace period. Will retry next cycle.")
         return
 
     await execute_sql(f"""
@@ -1518,6 +1525,20 @@ async def sync_mirrors():
     await cleanup_storage_duplicates()
     await reconcile_storage()
     storage_files = await get_storage_files()
+
+    # Auto-dismiss archive/manual episodes that should not be mirrored (e.g. One Piece old episodes)
+    try:
+        await execute_sql("""
+            UPDATE episodes
+            SET mirror_720_missing = 1,
+                mirror_480_missing = 1,
+                mirror_updated_at = ?
+            WHERE anime_id IN (SELECT id FROM anime WHERE anilist_id = 21)
+              AND episode_number < 1100
+              AND (COALESCE(mirror_720_missing, 0) = 0 OR COALESCE(mirror_480_missing, 0) = 0)
+        """, [int(time.time())])
+    except Exception as cl_ex:
+        log_message(f"Archive cleanup warning: {cl_ex}")
 
     episodes = await get_candidate_episodes(CANDIDATE_POOL_SIZE)
 
