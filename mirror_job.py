@@ -47,7 +47,7 @@ def _int_env(name: str, default: int) -> int:
 VIDEO_EXTENSIONS = (".mkv", ".mp4", ".avi", ".webm")
 TARGET_QUALITIES = ("720p", "480p")
 DOWNLOAD_TIMEOUT = _int_env("DOWNLOAD_TIMEOUT", 360)
-MIN_SEEDERS = _int_env("MIN_SEEDERS", 7)
+MIN_SEEDERS = _int_env("MIN_SEEDERS", 10)
 MAX_MIRRORS_PER_RUN = _int_env("MAX_MIRRORS_PER_RUN", 2)
 CANDIDATE_POOL_SIZE = _int_env("CANDIDATE_POOL_SIZE", 15)
 MAX_REPAIRS_PER_RUN = _int_env("MAX_REPAIRS_PER_RUN", 3)
@@ -878,12 +878,12 @@ async def search_quality(romaji: str, english: str, ep: int, quality: str, aired
     tier3_only = (aired_at > 0) and (now_ts - aired_at < 600)
 
     def get_min_seeders_for(title: str) -> int:
-        trusted = is_trusted_release(title)
-        if trusted and (aired_at > 0) and (now_ts - aired_at < 7200):
+        is_erai = bool(re.search(r'\[?erai[-_ ]?raws\]?', title.lower()))
+        if is_erai and (aired_at > 0) and (now_ts - aired_at < 7200):
             return 1
-        elif trusted:
+        elif is_erai:
             return 2
-        return MIN_SEEDERS
+        return max(10, MIN_SEEDERS)
 
     # Date sanity check: a release published far earlier than the airing date is an outdated/false-positive match
     def is_valid_release_date(pub_date: int) -> bool:
