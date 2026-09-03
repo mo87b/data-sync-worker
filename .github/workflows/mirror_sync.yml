@@ -33,7 +33,7 @@ jobs:
       - name: Install System Utilities
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends aria2
+          sudo apt-get install -y --no-install-recommends aria2 ffmpeg
 
       - name: Install Dependencies
         run: pip install -r requirements.txt
