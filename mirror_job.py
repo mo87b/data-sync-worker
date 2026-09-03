@@ -157,6 +157,7 @@ async def ensure_schema():
     existing_cols = await execute_sql("PRAGMA table_info(episodes)")
     existing = {row["name"] for row in existing_cols or []}
     columns = {
+        "duration": "INTEGER",
         "pixeldrain_1080_url": "TEXT",
         "pixeldrain_1080_id": "TEXT",
         "pixeldrain_720_url": "TEXT",
@@ -1116,21 +1117,36 @@ def inspect_media_tracks(video_path: str) -> tuple:
 
     found_subs = set()
     found_audio = set()
+    duration_sec = 0
 
     try:
         cmd = [
             "ffprobe",
             "-v", "quiet",
             "-print_format", "json",
+            "-show_format",
             "-show_streams",
-            "-show_entries", "stream=codec_type:stream_tags=language,title",
+            "-show_entries", "stream=codec_type,duration:stream_tags=language,title:format=duration",
             video_path
         ]
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
         if res.returncode == 0 and res.stdout:
             data = json.loads(res.stdout)
+            fmt_dur = data.get("format", {}).get("duration")
+            if fmt_dur:
+                try:
+                    duration_sec = int(round(float(fmt_dur)))
+                except (ValueError, TypeError):
+                    pass
+
             streams = data.get("streams", [])
             for s in streams:
+                if not duration_sec and s.get("duration"):
+                    try:
+                        duration_sec = int(round(float(s["duration"])))
+                    except (ValueError, TypeError):
+                        pass
+
                 c_type = s.get("codec_type")
                 tags = s.get("tags") or {}
                 lang_tag = tags.get("language")
@@ -1155,7 +1171,7 @@ def inspect_media_tracks(video_path: str) -> tuple:
     sorted_subs = sorted(found_subs, key=lambda x: ORDER.index(x) if x in ORDER else 99)
     sorted_audio = sorted(found_audio, key=lambda x: ORDER.index(x) if x in ORDER else 99)
 
-    return ", ".join(sorted_subs), ", ".join(sorted_audio)
+    return ", ".join(sorted_subs), ", ".join(sorted_audio), duration_sec
 
 
 def download_release(link: str, release_title: str):
@@ -1560,7 +1576,7 @@ async def mark_quality_missing(ep, quality: str):
     ep[f"mirror_{q}_missing"] = 1
 
 
-async def save_episode_mirror(ep, quality: str, upload, source: str = None, subs: str = None, audio: str = None):
+async def save_episode_mirror(ep, quality: str, upload, source: str = None, subs: str = None, audio: str = None, duration: int = 0):
     q = quality_key(quality)
     now_ts = int(time.time())
     master_subs = ep.get("subtitles") or subs
@@ -1575,9 +1591,10 @@ async def save_episode_mirror(ep, quality: str, upload, source: str = None, subs
             subtitles_{q} = ?,
             audio_tracks_{q} = ?,
             subtitles = ?,
-            audio_tracks = ?
+            audio_tracks = ?,
+            duration = CASE WHEN ? > 0 AND (duration IS NULL OR duration = 0) THEN ? ELSE duration END
         WHERE id = ?
-    """, [now_ts, source, upload["url"], upload.get("file_id"), subs, audio, master_subs, master_audio, ep["ep_id"]])
+    """, [now_ts, source, upload["url"], upload.get("file_id"), subs, audio, master_subs, master_audio, duration, duration, ep["ep_id"]])
 
     ep[f"pixeldrain_{q}_url"] = upload["url"]
     ep[f"pixeldrain_{q}_id"] = upload.get("file_id")
@@ -1633,14 +1650,14 @@ async def mirror_quality(ep, quality: str, storage_files: dict) -> bool:
     saved = False
     try:
         if not provider_done(ep, quality, "pixeldrain"):
-            subs_found, audio_found = inspect_media_tracks(video_path)
+            subs_found, audio_found, duration_found = inspect_media_tracks(video_path)
 
             existing_file = storage_files.get(video_name.lower())
             if existing_file:
                 upload = {"url": f"{STORAGE_API}/file/{existing_file['id']}", "file_id": existing_file["id"]}
             else:
                 upload = await asyncio.to_thread(upload_to_storage, video_path, video_name)
-            await save_episode_mirror(ep, quality, upload, stored_source, subs=subs_found, audio=audio_found)
+            await save_episode_mirror(ep, quality, upload, stored_source, subs=subs_found, audio=audio_found, duration=duration_found)
             log_message(f"Saved {quality} mirror for {ep['title_romaji']} ep {ep['episode_number']}.")
             saved = True
     finally:
