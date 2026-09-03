@@ -14,6 +14,7 @@ import email.utils
 import urllib.parse
 import xml.etree.ElementTree as ET
 import httpx
+import unicodedata
 
 # --- Environment Configuration ---
 TURSO_URL = os.environ.get("TURSO_URL", "")
@@ -228,9 +229,17 @@ async def get_candidate_episodes(limit: int) -> list:
 
 
 # --- Title Parsing Functions ---
+def strip_accents(text: str) -> str:
+    if not text or not isinstance(text, str):
+        return ""
+    normalized = unicodedata.normalize('NFKD', text)
+    return "".join(c for c in normalized if unicodedata.category(c) != 'Mn')
+
+
 def clean_title(title: str) -> str:
     if not title or not isinstance(title, str):
         return ""
+    title = strip_accents(title)
     title = re.sub(r'\(.*?\)', '', title)
     title = re.sub(r'\[.*?\]', '', title)
     title = re.sub(r'[:\\/*?"<>|]', ' ', title)
@@ -656,6 +665,10 @@ def get_search_queries(romaji: str, english: str, ep: int, quality: str, synonym
         if cleaned_erai:
             search_bases.append(cleaned_erai)
     search_bases.extend([r_base, e_base])
+    raw_r = re.sub(r'[:\\/*?"<>|\[\]\(\)]', ' ', romaji).strip()
+    raw_r = re.sub(r'\s+', ' ', raw_r)
+    if raw_r and raw_r != r_base and raw_r not in search_bases:
+        search_bases.append(raw_r)
     
     # Collapsed variations (e.g. "Dogul Wang" -> "Dogulwang", "Chainsaw Man" -> "Chainsawman")
     if len(r_base.split()) >= 2:
