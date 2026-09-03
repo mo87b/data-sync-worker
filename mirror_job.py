@@ -344,11 +344,15 @@ def get_audio_score(title: str) -> int:
     t_lower = title.lower()
 
     # 1. Multi-Audio (highest priority)
-    if re.search(r'\bmulti[- ]audio\b|multiaudio|\bmulti\s+aac\b', t_lower):
+    if (re.search(r'\bmulti[-_ ]*audio\b|\bmultiaudio\b', t_lower) or
+        re.search(r'\bmulti[-_\.\s]*(aac|ddp|ac3|flac|opus|dts)', t_lower) or
+        re.search(r'[\.\[\(]multi[\.\]\)](?![-_\.\s]*sub)', t_lower)):
         return 4
 
     # 2. Dual-Audio
-    if re.search(r'\bdual[- ]audio\b|dualaudio|\bdual\s+aac\b|\bdual\b', t_lower):
+    if (re.search(r'\bdual[-_ ]*audio\b|\bdualaudio\b', t_lower) or
+        re.search(r'\bdual[-_\.\s]*(aac|ddp|ac3|flac|opus|dts)', t_lower) or
+        re.search(r'[\.\[\(]dual[\.\]\)]|\bdual\b', t_lower)):
         return 3
 
     # 3. Check for Explicit Foreign Audio Only (Korean, Chinese, English dub, etc. without Dual/Multi)
