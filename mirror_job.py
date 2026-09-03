@@ -925,13 +925,108 @@ async def search_quality(romaji: str, english: str, ep: int, quality: str, aired
     log_message(f"Search done: {len(good)} good matches found")
 
     if good:
-        # Smart sort: Multi-Audio (2) > Dual-Audio (1) > Single (0), then trusted groups, then platform score, then seeders
-        good.sort(key=lambda r: (
-            get_audio_score(r["title"]),
-            1 if is_trusted_release(r["title"]) else 0,
-            get_platform_score(r["title"]),
-            r["seeders"],
-        ), reverse=True)
+        def _has_arabic_variants(text: str) -> bool:
+            if not text: return False
+            t = text.lower()
+            return bool(re.search(r'\barabic\b|\bara\b|(?<!\w)ar(?!\w)|العربية|عربي', t))
+
+        multi_subs_candidates = [r for r in good if bool(re.search(r'\b(multi|m)\s*[-_:]?\s*subs?\b|multisubs?', r["title"].lower()))]
+        platforms_in_multi = set()
+        for r in multi_subs_candidates:
+            if re.search(r'\b(cr|crunchyroll)\b', r["title"].lower()):
+                platforms_in_multi.add('cr')
+            elif re.search(r'\b(nf|netflix)\b', r["title"].lower()):
+                platforms_in_multi.add('nf')
+            elif re.search(r'\b(amzn|amazon)\b', r["title"].lower()):
+                platforms_in_multi.add('amzn')
+            elif re.search(r'\b(bilibili|bili)\b', r["title"].lower()):
+                platforms_in_multi.add('bili')
+            else:
+                platforms_in_multi.add('other')
+
+        has_repack = any(bool(re.search(r'\b(repack|re-pack|v2)\b', r["title"].lower())) for r in good)
+        has_multiple_platforms = (len(multi_subs_candidates) >= 2 and len(platforms_in_multi) >= 2)
+        has_repack_check = (has_repack and len(good) >= 2)
+
+        arabic_cache = {}
+        if has_multiple_platforms or has_repack_check:
+            async def _check_arabic_for_item(item):
+                source = item.get("source", "")
+                view_url = None
+                if "nyaa.si/download/" in source:
+                    view_url = source.replace("/download/", "/view/").split(".torrent")[0]
+                elif "nyaa.si/view/" in source:
+                    view_url = source
+                else:
+                    view_url = source
+
+                # 1. Direct fetch first
+                try:
+                    async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+                        r = await client.get(view_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+                        if r.status_code == 200 and "Subtitles Info" in r.text:
+                            return _has_arabic_variants(r.text)
+                except Exception:
+                    pass
+
+                # 2. GAS proxy fallback
+                for proxy_base in get_ordered_proxies():
+                    try:
+                        async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client:
+                            gas_url = f"{proxy_base}?mode=torrent&url={urllib.parse.quote(view_url)}"
+                            r2 = await client.get(gas_url)
+                            if r2.status_code == 200:
+                                try:
+                                    data = r2.json()
+                                    if data.get("data"):
+                                        html = base64.b64decode(data["data"]).decode('utf-8', errors='ignore')
+                                        return _has_arabic_variants(html)
+                                except Exception:
+                                    pass
+                                return _has_arabic_variants(r2.text)
+                    except Exception:
+                        continue
+                return _has_arabic_variants(item.get("title", ""))
+
+            check_tasks = [_check_arabic_for_item(r) for r in good]
+            try:
+                results = await asyncio.gather(*check_tasks, return_exceptions=True)
+                for idx, res in enumerate(results):
+                    key = good[idx].get("source", "")
+                    if isinstance(res, Exception):
+                        arabic_cache[key] = False
+                    else:
+                        arabic_cache[key] = bool(res)
+                        if res:
+                            log_message(f"Arabic subtitle found in: {good[idx]['title'][:60]}")
+            except Exception as e:
+                log_message(f"Arabic check failed: {e}")
+
+        def _arabic_score(item):
+            return 1 if arabic_cache.get(item.get("source", ""), False) else 0
+
+        def _repack_score(item):
+            return 1 if re.search(r'\b(repack|re-pack|v2)\b', item["title"].lower()) else 0
+
+        any_arabic_found = any(arabic_cache.values()) if arabic_cache else False
+
+        if any_arabic_found:
+            good.sort(key=lambda r: (
+                _arabic_score(r),
+                _repack_score(r),
+                get_audio_score(r["title"]),
+                1 if is_trusted_release(r["title"]) else 0,
+                get_platform_score(r["title"]),
+                r["seeders"],
+            ), reverse=True)
+        else:
+            good.sort(key=lambda r: (
+                get_audio_score(r["title"]),
+                _repack_score(r),
+                1 if is_trusted_release(r["title"]) else 0,
+                get_platform_score(r["title"]),
+                r["seeders"],
+            ), reverse=True)
         return good[0]
 
     return None
